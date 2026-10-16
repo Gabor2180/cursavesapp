@@ -147,6 +147,22 @@ class GitBackend(SyncBackend):
             return True
 
         try:
+            # Empty remote (init'd but never pushed) — nothing to fetch yet
+            ls_remote = subprocess.run(
+                ["git", "ls-remote", "--heads", "origin"],
+                cwd=str(self.sync_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            if ls_remote.returncode == 0 and not ls_remote.stdout.strip():
+                return True
+            if ls_remote.returncode != 0:
+                err = (ls_remote.stderr or ls_remote.stdout or "git ls-remote failed").strip()
+                print(f"  Remote check failed: {err}", file=sys.stderr)
+                return False
+
             fetch = subprocess.run(
                 ["git", "fetch", "--depth", "1", "origin"],
                 cwd=str(self.sync_dir),
@@ -156,12 +172,22 @@ class GitBackend(SyncBackend):
                 timeout=180,
             )
             if fetch.returncode != 0:
+                err = (fetch.stderr or fetch.stdout or "git fetch failed").strip()
+                print(f"  Fetch failed: {err}", file=sys.stderr)
                 return False
 
-            subprocess.run(
+            checkout = subprocess.run(
                 ["git", "checkout", "-f", "-B", "main", "origin/main"],
-                cwd=str(self.sync_dir), capture_output=True,
+                cwd=str(self.sync_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
             )
+            if checkout.returncode != 0:
+                err = (checkout.stderr or checkout.stdout or "git checkout failed").strip()
+                print(f"  Checkout failed: {err}", file=sys.stderr)
+                return False
+
             subprocess.run(
                 ["git", "reset", "--hard", "origin/main"],
                 cwd=str(self.sync_dir), capture_output=True,
@@ -176,6 +202,7 @@ class GitBackend(SyncBackend):
             )
             return True
         except subprocess.TimeoutExpired:
+            print("  Remote sync timed out", file=sys.stderr)
             return False
 
     def init_repo(self, remote: Optional[str] = None):

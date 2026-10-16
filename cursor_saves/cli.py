@@ -1012,6 +1012,7 @@ def cmd_sync(args):
             print(" done")
         else:
             print(" failed", file=sys.stderr)
+            _print_remote_sync_tip()
             return
 
     # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
@@ -1167,9 +1168,22 @@ def _backend_pull() -> bool:
     if backend.pull(snapshots_dir):
         print(" done")
         return True
-    else:
-        print(" failed", file=sys.stderr)
-        return False
+    print(" failed", file=sys.stderr)
+    _print_remote_sync_tip()
+    return False
+
+
+def _print_remote_sync_tip():
+    """Print how to diagnose a failed git remote sync."""
+    sync = paths.get_sync_dir()
+    print(
+        "  Tip: on this machine run:\n"
+        f"    git -C \"{sync}\" remote -v\n"
+        f"    git -C \"{sync}\" ls-remote origin\n"
+        "  Both machines must use the same remote URL, and git must be able to auth.\n"
+        "  Re-point with: cursaves init --remote <same-url-as-other-machine>",
+        file=sys.stderr,
+    )
 
 
 def cmd_pull(args):
