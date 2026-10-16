@@ -11,6 +11,7 @@ There are two databases that matter, plus some auxiliary files:
 ```
 ~/Library/Application Support/Cursor/User/   (macOS)
 ~/.config/Cursor/User/                        (Linux)
+%APPDATA%\Cursor\User\                        (Windows)
 ├── globalStorage/
 │   └── state.vscdb                           # Global DB -- conversation content + central index (3.0+)
 └── workspaceStorage/
@@ -412,11 +413,14 @@ This means you can create a new workspace directory with any unique ID, put a co
 
 **Location:** `~/.cursor/projects/{sanitized-path}/agent-transcripts/{composerId}.txt`
 
-Cursor also writes plain text transcripts of agent conversations. The directory name is the project path with `/` replaced by `-` and the leading slash stripped:
+Cursor also writes plain text transcripts of agent conversations. The directory name is the project path with `/` (or `\`) replaced by `-`, the leading slash stripped, and Windows drive-letter colons removed (not turned into dashes):
 
 ```
 /Users/callum/Desktop/Projects/my-app
 → Users-callum-Desktop-Projects-my-app
+
+C:\Users\callum\Desktop\Projects\my-app
+→ C-Users-callum-Desktop-Projects-my-app
 ```
 
 These are read-only logs. Cursor does not load conversations from these files -- they're supplementary to the SQLite data.

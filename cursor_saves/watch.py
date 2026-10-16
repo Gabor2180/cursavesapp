@@ -60,7 +60,7 @@ def _git_has_remote(repo_root: Path) -> bool:
         result = subprocess.run(
             ["git", "remote"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
         )
         return result.returncode == 0 and result.stdout.strip() != ""
@@ -82,7 +82,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         subprocess.run(
             ["git", "fetch", "origin"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
             timeout=30,
         )
@@ -95,7 +95,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         pull_result = subprocess.run(
             ["git", "rebase", "--autostash", "origin/main"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
             timeout=30,
         )
@@ -106,7 +106,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         add_result = subprocess.run(
             ["git", "add", "snapshots/"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
             timeout=10,
         )
@@ -117,7 +117,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         status_result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
         )
         if status_result.returncode == 0:
@@ -129,7 +129,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         commit_result = subprocess.run(
             ["git", "commit", "-m", commit_msg],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(repo_root),
             timeout=10,
         )
@@ -141,7 +141,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
             push_result = subprocess.run(
                 ["git", "push", "-u", "origin", "HEAD"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8", errors="replace",
                 cwd=str(repo_root),
                 timeout=30,
             )

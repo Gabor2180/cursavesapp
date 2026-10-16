@@ -8,25 +8,45 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, unquote
+
+
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+def get_config_dir() -> Path:
+    """Return the cursaves config directory.
+
+    Linux/macOS: ~/.config/cursaves/
+    Windows: %APPDATA%/cursaves/
+    """
+    if _is_windows():
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "cursaves"
+    return Path.home() / ".config" / "cursaves"
 
 
 def get_cursor_user_dir() -> Path:
     """Return the Cursor User data directory for the current platform.
 
-    macOS:  ~/Library/Application Support/Cursor/User
-    Linux:  ~/.config/Cursor/User
+    macOS:   ~/Library/Application Support/Cursor/User
+    Linux:   ~/.config/Cursor/User
+    Windows: %APPDATA%\\Cursor\\User
     """
     system = platform.system()
     if system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "Cursor" / "User"
     elif system == "Linux":
         base = Path.home() / ".config" / "Cursor" / "User"
+    elif system == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "Cursor" / "User"
     else:
         print(
             f"Error: Unsupported platform '{system}'.\n"
-            f"cursaves supports macOS and Linux.\n"
+            f"cursaves supports macOS, Linux, and Windows.\n"
             f"On macOS, Cursor data is at ~/Library/Application Support/Cursor/User/\n"
-            f"On Linux, Cursor data is at ~/.config/Cursor/User/",
+            f"On Linux, Cursor data is at ~/.config/Cursor/User/\n"
+            f"On Windows, Cursor data is at %APPDATA%\\Cursor\\User\\",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -66,9 +86,57 @@ def sanitize_project_path(project_path: str) -> str:
     """Convert a project path to Cursor's sanitized directory name format.
 
     /Users/callum/Desktop/Projects/myrepo -> Users-callum-Desktop-Projects-myrepo
+    C:\\Users\\callum\\Projects\\myrepo -> C-Users-callum-Projects-myrepo
+
+    Cursor strips drive-letter colons on Windows (C: -> C) rather than
+    replacing them with dashes.
     """
-    # Strip leading slash and replace / with -
-    return project_path.strip("/").replace("/", "-")
+    normalized = project_path.replace("\\", "/")
+    normalized = normalized.replace(":", "")
+    return normalized.strip("/").replace("/", "-")
+
+
+def path_to_file_uri(path: str) -> str:
+    """Build a file:// URI for an absolute filesystem path.
+
+    Unix:    /Users/a/b  -> file:///Users/a/b
+    Windows: C:\\Users\\a -> file:///C:/Users/a
+    """
+    normalized = os.path.normpath(path).replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return "file:///" + quote(normalized, safe="/:")
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return "file://" + quote(normalized, safe="/")
+
+
+def decode_file_uri(uri: str) -> str:
+    """Decode a file:// URI to a local filesystem path.
+
+    Handles URL-encoded characters (%20, %3A, etc.) and strips the leading
+    slash that file URIs add in front of Windows drive letters
+    (/C:/... -> C:/...).
+    """
+    path = unquote(uri[len("file://"):] if uri.startswith("file://") else uri)
+    # file:///C:/Users/... -> /C:/Users/... after scheme strip
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    if _is_windows():
+        path = path.replace("/", "\\")
+    return path
+
+
+def normalize_path_for_compare(path: str) -> str:
+    """Normalize a path for equality / substring comparison."""
+    normalized = os.path.normpath(os.path.expanduser(path))
+    if _is_windows():
+        return normalized.replace("/", "\\").casefold()
+    return normalized
+
+
+def paths_equal(a: str, b: str) -> bool:
+    """Compare two filesystem paths, case-insensitively on Windows."""
+    return normalize_path_for_compare(a) == normalize_path_for_compare(b)
 
 
 def _decode_ssh_host(host: str) -> str:
@@ -99,9 +167,6 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     if not ws_storage.exists():
         return []
 
-    # Normalise the target path for comparison
-    target = os.path.normpath(os.path.expanduser(project_path))
-
     matches = []
     for ws_dir in ws_storage.iterdir():
         if not ws_dir.is_dir():
@@ -114,9 +179,7 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             folder_uri = data.get("folder", "")
             # Handle file:// URIs
             if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://") :]
-                # URL-decode common escapes
-                folder_path = folder_path.replace("%20", " ")
+                folder_path = decode_file_uri(folder_uri)
             elif folder_uri.startswith("vscode-remote://"):
                 # SSH remote workspace - extract the path portion
                 # Format: vscode-remote://ssh-remote%2B<host>/<path>
@@ -128,7 +191,7 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             else:
                 continue
 
-            if os.path.normpath(folder_path) == target:
+            if paths_equal(folder_path, project_path):
                 matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
@@ -148,6 +211,19 @@ def find_transcript_dir(project_path: str) -> Optional[Path]:
     transcript_dir = projects_dir / sanitized / "agent-transcripts"
     if transcript_dir.exists():
         return transcript_dir
+
+    # Cursor lowercases the Windows drive letter in some versions
+    # (C-Users-... vs c-Users-...). Fall back to case-insensitive match.
+    if _is_windows():
+        target = sanitized.casefold()
+        try:
+            for entry in projects_dir.iterdir():
+                if entry.is_dir() and entry.name.casefold() == target:
+                    candidate = entry / "agent-transcripts"
+                    if candidate.exists():
+                        return candidate
+        except OSError:
+            pass
 
     return None
 
@@ -192,8 +268,7 @@ def list_all_workspaces() -> list[dict]:
                 ws_uri = data["workspace"]
                 if ws_uri.startswith("file://"):
                     folder_uri = ws_uri
-                    folder_path = ws_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
+                    folder_path = decode_file_uri(ws_uri)
                     ws_type = "workspace"
                 else:
                     continue
@@ -203,8 +278,7 @@ def list_all_workspaces() -> list[dict]:
                     continue
 
                 if folder_uri.startswith("file://"):
-                    folder_path = folder_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
+                    folder_path = decode_file_uri(folder_uri)
                 elif folder_uri.startswith("vscode-remote://"):
                     ws_type = "ssh"
                     # Format: vscode-remote://ssh-remote%2B<host>/<path>
@@ -213,12 +287,13 @@ def list_all_workspaces() -> list[dict]:
                         host = authority.split("%2B", 1)[1]
                     elif "+" in authority:
                         host = authority.split("+", 1)[1]
-                    # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
+                    # Decode URL-encoded and hex-encoded JSON hosts
                     if host:
+                        host = unquote(host)
                         host = _decode_ssh_host(host)
                     parts = folder_uri.split("/", 3)
                     if len(parts) >= 4:
-                        folder_path = "/" + parts[3]
+                        folder_path = "/" + unquote(parts[3])
                     else:
                         continue
                 else:
@@ -411,9 +486,15 @@ def resolve_workspace(selector: str) -> Optional[dict]:
             if name == selector:
                 return ws
 
-    # Try as path substring
+    # Try as path substring (normalize separators so \ and / both match)
+    norm_selector = selector.replace("\\", "/")
+    if _is_windows():
+        norm_selector = norm_selector.casefold()
     for ws in workspaces:
-        if selector in ws["path"]:
+        norm_path = ws["path"].replace("\\", "/")
+        if _is_windows():
+            norm_path = norm_path.casefold()
+        if norm_selector in norm_path:
             return ws
 
     return None
@@ -440,10 +521,9 @@ def is_sync_repo_initialized() -> bool:
     if (sync_dir / ".git").exists():
         return True
     # Check for non-git backend config
-    config_path = Path.home() / ".config" / "cursaves" / "config.json"
+    config_path = get_config_dir() / "config.json"
     if config_path.exists():
         try:
-            import json
             cfg = json.loads(config_path.read_text())
             return cfg.get("backend") in ("s3", "azure")
         except Exception:
@@ -474,6 +554,8 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
     all_ws = list_all_workspaces()
     source_normalized = os.path.normpath(source_path)
     source_basename = os.path.basename(source_normalized)
+    if _is_windows():
+        source_basename = source_basename.casefold()
 
     exact_matches = []
     basename_matches = []
@@ -481,8 +563,10 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
     for ws in all_ws:
         ws_path = ws["path"]
         ws_basename = os.path.basename(ws_path)
+        if _is_windows():
+            ws_basename = ws_basename.casefold()
 
-        if ws_path == source_normalized:
+        if paths_equal(ws_path, source_normalized):
             exact_matches.append(ws)
         elif ws_basename == source_basename:
             basename_matches.append(ws)
@@ -546,7 +630,8 @@ def _get_git_remote_url(project_path: str) -> Optional[str]:
         result = subprocess.run(
             ["git", "-C", project_path, "config", "--get", "remote.origin.url"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():

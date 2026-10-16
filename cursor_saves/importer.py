@@ -108,12 +108,19 @@ def is_cursor_running() -> bool:
     characters. Instead we parse `ps -axo args` and look for the main
     Cursor executable while excluding helpers, crash handlers, and the
     macOS CursorUIViewService system process.
+
+    On Windows, uses tasklist to look for Cursor.exe.
     """
+    import platform
+
+    if platform.system() == "Windows":
+        return _is_cursor_running_windows()
     try:
         result = subprocess.run(
             ["ps", "-axo", "args"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             return False
@@ -127,30 +134,138 @@ def is_cursor_running() -> bool:
         return False
 
 
+def _is_cursor_running_windows() -> bool:
+    """Check if Cursor.exe is running on Windows."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/NH"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            if "Cursor.exe" in line:
+                return True
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})
+
+
+def _raw_file_uri(path: str) -> str:
+    """file:// URI without percent-encoding (Cursor sometimes stores these)."""
+    normalized = os.path.normpath(path).replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return "file:///" + normalized
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return "file://" + normalized
+
+
+def _dominant_sep(path: str) -> str:
+    if path.count("\\") >= path.count("/") and "\\" in path:
+        return "\\"
+    return "/"
+
+
+_PATH_END_CHARS = frozenset("\"' \t\n\r<>|*?,;)}]#")
+
+
+def _rewrite_path_string(value: str, old_prefix: str, new_prefix: str) -> str:
+    """Rewrite filesystem paths and file:// URIs in a single string."""
+    result = value
+
+    uri_pairs = [
+        (paths.path_to_file_uri(old_prefix), paths.path_to_file_uri(new_prefix)),
+        (_raw_file_uri(old_prefix), _raw_file_uri(new_prefix)),
+    ]
+    for old_uri, new_uri in sorted(uri_pairs, key=lambda p: len(p[0]), reverse=True):
+        if old_uri and old_uri != new_uri and old_uri in result:
+            result = result.replace(old_uri, new_uri)
+
+    variants = []
+    seen = set()
+    for variant in (
+        old_prefix,
+        old_prefix.replace("\\", "/"),
+        old_prefix.replace("/", "\\"),
+    ):
+        if variant and variant not in seen:
+            variants.append(variant)
+            seen.add(variant)
+    variants.sort(key=len, reverse=True)
+
+    new_sep = _dominant_sep(new_prefix)
+    for old in variants:
+        if old not in result:
+            continue
+        out: list[str] = []
+        start = 0
+        while True:
+            idx = result.find(old, start)
+            if idx < 0:
+                out.append(result[start:])
+                break
+            # Skip if this hit is inside a file:// URI we already rewrote
+            if idx >= 7 and result[idx - 7 : idx].lower() == "file://":
+                out.append(result[start : idx + len(old)])
+                start = idx + len(old)
+                continue
+            if idx >= 8 and result[idx - 8 : idx].lower() == "file:///":
+                out.append(result[start : idx + len(old)])
+                start = idx + len(old)
+                continue
+
+            out.append(result[start:idx])
+            out.append(new_prefix)
+            pos = idx + len(old)
+            while pos < len(result):
+                ch = result[pos]
+                if ch in "/\\":
+                    out.append(new_sep)
+                    pos += 1
+                    continue
+                if ch in _PATH_END_CHARS:
+                    break
+                out.append(ch)
+                pos += 1
+            start = pos
+        result = "".join(out)
+        break
+
+    return result
 
 
 def rewrite_paths(data: Any, old_prefix: str, new_prefix: str) -> Any:
     """Recursively rewrite absolute paths in conversation data.
 
     Replaces old_prefix with new_prefix in all string values that
-    look like file paths.  Skips binary/encoded fields like
-    ``conversationState`` (base64-encoded protobuf) that should
-    never be modified.
+    look like file paths, including file:// URI forms and both slash
+    styles. Continuations after the prefix are normalized to the target
+    OS separator. Skips binary/encoded fields like ``conversationState``
+    (base64-encoded protobuf) that should never be modified.
     """
-    if isinstance(data, str):
-        if old_prefix in data:
-            return data.replace(old_prefix, new_prefix)
+    if old_prefix == new_prefix:
         return data
-    elif isinstance(data, dict):
-        return {
-            k: (v if k in _SKIP_REWRITE_KEYS else rewrite_paths(v, old_prefix, new_prefix))
-            for k, v in data.items()
-        }
-    elif isinstance(data, list):
-        return [rewrite_paths(item, old_prefix, new_prefix) for item in data]
-    else:
-        return data
+
+    def _rewrite(value: Any) -> Any:
+        if isinstance(value, str):
+            return _rewrite_path_string(value, old_prefix, new_prefix)
+        if isinstance(value, dict):
+            return {
+                k: (v if k in _SKIP_REWRITE_KEYS else _rewrite(v))
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [_rewrite(item) for item in value]
+        return value
+
+    return _rewrite(data)
 
 
 def find_or_create_workspace(project_path: str) -> Path:
@@ -169,8 +284,9 @@ def find_or_create_workspace(project_path: str) -> Path:
     ws_dir = ws_storage / ws_id
     ws_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create workspace.json
-    folder_uri = "file://" + os.path.normpath(project_path)
+    # Create workspace.json with a proper file:// URI (Windows needs
+    # file:///C:/... not file://C:\...)
+    folder_uri = paths.path_to_file_uri(os.path.normpath(project_path))
     ws_json = ws_dir / "workspace.json"
     ws_json.write_text(json.dumps({"folder": folder_uri}))
 
@@ -828,9 +944,10 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
 
     uri_obj: dict = {"$mid": 1}
     if folder_uri.startswith("file://"):
-        fs_path = folder_uri[len("file://"):].replace("%20", " ")
+        fs_path = paths.decode_file_uri(folder_uri)
+        # VS Code URI.path always uses forward slashes; fsPath is OS-native
         uri_obj["fsPath"] = fs_path
-        uri_obj["path"] = fs_path
+        uri_obj["path"] = fs_path.replace("\\", "/")
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "file"
     elif folder_uri.startswith("vscode-remote://"):

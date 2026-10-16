@@ -22,6 +22,8 @@ def reload_cursor_window() -> bool:
         return _reload_macos()
     elif system == "Linux":
         return _reload_linux()
+    elif system == "Windows":
+        return _reload_windows()
     else:
         return False
 
@@ -116,6 +118,51 @@ def _reload_linux() -> bool:
 
         return True
 
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _reload_windows() -> bool:
+    """Use PowerShell SendKeys to trigger Developer: Reload Window."""
+    try:
+        check = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process -Name Cursor -ErrorAction SilentlyContinue",
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if not check.stdout.strip():
+            print("  Cursor is not running, skipping reload.", file=sys.stderr)
+            return False
+
+        ps_script = (
+            "$wshell = New-Object -ComObject WScript.Shell; "
+            "$cursor = Get-Process -Name Cursor | "
+            "Where-Object {$_.MainWindowHandle -ne 0} | Select-Object -First 1; "
+            "if ($cursor) { "
+            "  [void]$wshell.AppActivate($cursor.Id); "
+            "  Start-Sleep -Milliseconds 300; "
+            "  $wshell.SendKeys('^+p'); "
+            "  Start-Sleep -Milliseconds 400; "
+            "  $wshell.SendKeys('Developer: Reload Window'); "
+            "  Start-Sleep -Milliseconds 300; "
+            "  $wshell.SendKeys('{ENTER}') "
+            "}"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
