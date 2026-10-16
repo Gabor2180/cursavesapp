@@ -157,6 +157,133 @@ class CursorDB:
         except json.JSONDecodeError:
             return None
 
+    def table_exists(self, name: str) -> bool:
+        """Return True if a table exists in this database."""
+        conn = self._ensure_read_copy()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+            return row is not None
+        except sqlite3.OperationalError:
+            return False
+
+    def list_composer_header_entries(self) -> list[dict]:
+        """Read all rows from the composerHeaders table (Cursor table-gate format).
+
+        Each row's ``value`` column is JSON matching the old allComposers entry
+        shape. Returns an empty list if the table is missing.
+        """
+        conn = self._ensure_read_copy()
+        try:
+            rows = conn.execute(
+                "SELECT composerId, workspaceId, value FROM composerHeaders"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        entries: list[dict] = []
+        for composer_id, workspace_id, value in rows:
+            entry: dict
+            if value:
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(value)
+                    entry = parsed if isinstance(parsed, dict) else {"composerId": composer_id}
+                except json.JSONDecodeError:
+                    entry = {"composerId": composer_id}
+            else:
+                entry = {"composerId": composer_id}
+
+            if "composerId" not in entry and composer_id:
+                entry["composerId"] = composer_id
+            # Prefer the indexed workspaceId column when present
+            if workspace_id:
+                wi = entry.get("workspaceIdentifier")
+                if not isinstance(wi, dict):
+                    entry["workspaceIdentifier"] = {"id": workspace_id}
+                elif not wi.get("id"):
+                    wi["id"] = workspace_id
+            entries.append(entry)
+        return entries
+
+    def upsert_composer_header_row(
+        self,
+        composer_id: str,
+        workspace_id: str,
+        entry: dict,
+    ) -> None:
+        """Insert or replace a row in the composerHeaders table."""
+        conn = self._get_write_conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS composerHeaders (
+                composerId TEXT PRIMARY KEY,
+                workspaceId TEXT,
+                createdAt INTEGER,
+                lastUpdatedAt INTEGER,
+                isArchived INTEGER,
+                isSubagent INTEGER,
+                recency INTEGER,
+                checkpointAt INTEGER,
+                value TEXT,
+                subagentTypeName TEXT
+            )
+            """
+        )
+        created_at = int(entry.get("createdAt") or 0)
+        last_updated = int(entry.get("lastUpdatedAt") or created_at or 0)
+        is_archived = 1 if entry.get("isArchived") else 0
+        is_subagent = 1 if entry.get("isSubagent") or entry.get("isBestOfNSubcomposer") else 0
+        recency = int(entry.get("recency") or last_updated or 0)
+        checkpoint_at = entry.get("conversationCheckpointLastUpdatedAt")
+        checkpoint_at = int(checkpoint_at) if checkpoint_at else None
+        subagent_type = entry.get("subagentTypeName")
+        value = json.dumps(entry, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO composerHeaders (
+                composerId, workspaceId, createdAt, lastUpdatedAt,
+                isArchived, isSubagent, recency, checkpointAt, value, subagentTypeName
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                composer_id,
+                workspace_id,
+                created_at,
+                last_updated,
+                is_archived,
+                is_subagent,
+                recency,
+                checkpoint_at,
+                value,
+                subagent_type,
+            ),
+        )
+        conn.commit()
+
+    def delete_composer_header_rows(self, composer_ids: list[str]) -> int:
+        """Delete rows from composerHeaders for the given composer IDs."""
+        if not composer_ids:
+            return 0
+        conn = self._get_write_conn()
+        try:
+            total = 0
+            for batch_start in range(0, len(composer_ids), 500):
+                batch = composer_ids[batch_start : batch_start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cur = conn.execute(
+                    f"DELETE FROM composerHeaders WHERE composerId IN ({placeholders})",
+                    batch,
+                )
+                total += cur.rowcount
+            conn.commit()
+            return total
+        except sqlite3.OperationalError:
+            return 0
+
     # ── Write operations (on original file) ─────────────────────────
 
     def _get_write_conn(self) -> sqlite3.Connection:

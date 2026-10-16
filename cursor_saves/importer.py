@@ -970,14 +970,28 @@ def _register_in_global_headers(
     composer_data: dict,
     ws_dir: Path,
 ) -> None:
-    """Register a conversation in the global composer.composerHeaders index.
+    """Register a conversation in the global chat index.
 
-    This is the Cursor 3.0+ central index that maps chats to workspaces.
-    Safe to call on any Cursor version — creates the index if absent.
+    Writes to the ``composerHeaders`` table when that format is active
+    (or already present). Otherwise falls back to the legacy
+    ``composer.composerHeaders`` ItemTable JSON blob.
     """
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path)
     try:
+        entry = _build_composer_header_entry(composer_id, composer_data)
+        entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+        workspace_id = entry["workspaceIdentifier"].get("id") or ws_dir.name
+
+        use_table = global_cdb.table_exists("composerHeaders")
+        gate = global_cdb.get_item(
+            "composer.composerHeaders.tableGateEnabled", table="ItemTable"
+        )
+        if use_table or (gate and str(gate).lower() in ("true", "1")):
+            global_cdb.upsert_composer_header_row(composer_id, workspace_id, entry)
+            paths.invalidate_headers_cache()
+            return
+
         headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers is None:
             headers = {"allComposers": []}
@@ -986,8 +1000,6 @@ def _register_in_global_headers(
         existing_ids = {c.get("composerId") for c in all_composers}
 
         if composer_id not in existing_ids:
-            entry = _build_composer_header_entry(composer_id, composer_data)
-            entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
             all_composers.append(entry)
             headers["allComposers"] = all_composers
             global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
@@ -1599,18 +1611,10 @@ def migrate_to_global_headers(
         print("Global DB not found.", file=sys.stderr)
         return 0, 0
 
-    # Read the current global headers
-    global_cdb = db.CursorDB(global_db_path)
-    try:
-        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
-    finally:
-        global_cdb.close()
-    if headers is None:
-        headers = {"allComposers": []}
-
-    existing_ids = {
-        c.get("composerId") for c in headers.get("allComposers", [])
-    }
+    # Read the current global headers (table or legacy ItemTable)
+    existing_headers = paths.get_global_composer_headers()
+    existing_ids = {c.get("composerId") for c in existing_headers if c.get("composerId")}
+    headers = {"allComposers": list(existing_headers)}
 
     # Scan all workspaces for chats not in the global index
     all_ws = paths.list_all_workspaces()
@@ -1715,7 +1719,20 @@ def migrate_to_global_headers(
     headers["allComposers"].extend(final_entries)
     write_cdb = db.CursorDB(global_db_path)
     try:
-        write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+        use_table = write_cdb.table_exists("composerHeaders")
+        gate = write_cdb.get_item(
+            "composer.composerHeaders.tableGateEnabled", table="ItemTable"
+        )
+        if use_table or (gate and str(gate).lower() in ("true", "1")):
+            for entry in final_entries:
+                cid = entry.get("composerId")
+                if not cid:
+                    continue
+                wi = entry.get("workspaceIdentifier") or {}
+                workspace_id = wi.get("id") or ""
+                write_cdb.upsert_composer_header_row(cid, workspace_id, entry)
+        else:
+            write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
     finally:
         write_cdb.close()
     paths.invalidate_headers_cache()
@@ -1871,7 +1888,8 @@ def purge_chats(
             keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
             total_keys += keys_deleted
 
-        # Remove from composer.composerHeaders (global DB, ItemTable)
+        # Remove from composerHeaders table (newer Cursor) and legacy ItemTable
+        write_cdb.delete_composer_header_rows(composer_ids)
         headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers and "allComposers" in headers:
             before = len(headers["allComposers"])
