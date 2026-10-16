@@ -345,13 +345,14 @@ def list_all_workspaces() -> list[dict]:
 
 
 def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
+    """Read the central chat index from the global DB.
 
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
+    Cursor currently uses one of two formats:
+      1. ``composerHeaders`` SQLite table (newer; tableGateEnabled)
+      2. ``composer.composerHeaders`` JSON in ItemTable (Cursor 3.0)
 
-    Returns an empty list if not present (pre-3.0 Cursor).
+    Returns the allComposers-equivalent list, each tagged with a
+    workspaceIdentifier. Empty list if neither format is present.
     """
     from . import db
 
@@ -360,6 +361,12 @@ def get_global_composer_headers() -> list[dict]:
         return []
     try:
         with db.CursorDB(global_db) as cdb:
+            # Prefer dedicated table when present and non-empty
+            if cdb.table_exists("composerHeaders"):
+                table_entries = cdb.list_composer_header_entries()
+                if table_entries:
+                    return table_entries
+
             headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
             if headers and isinstance(headers, dict):
                 return headers.get("allComposers", [])
