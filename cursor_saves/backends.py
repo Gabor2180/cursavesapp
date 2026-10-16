@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Optional
 
 
-_CONFIG_PATH = Path.home() / ".config" / "cursaves" / "config.json"
+def _get_config_path() -> Path:
+    from .paths import get_config_dir
+
+    return get_config_dir() / "config.json"
 
 
 # ── Abstract base ────────────────────────────────────────────────────────
@@ -93,7 +96,10 @@ class GitBackend(SyncBackend):
                 push_result = subprocess.run(
                     ["git", "push", "-u", "origin", "main"],
                     cwd=str(self.sync_dir),
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
                 )
                 if push_result.returncode != 0:
                     print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
@@ -107,7 +113,9 @@ class GitBackend(SyncBackend):
         try:
             result = subprocess.run(
                 ["git", "remote"],
-                capture_output=True, text=True,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=str(self.sync_dir),
             )
             return result.returncode == 0 and result.stdout.strip() != ""
@@ -142,7 +150,10 @@ class GitBackend(SyncBackend):
             fetch = subprocess.run(
                 ["git", "fetch", "--depth", "1", "origin"],
                 cwd=str(self.sync_dir),
-                capture_output=True, text=True, timeout=180,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
             )
             if fetch.returncode != 0:
                 return False
@@ -200,7 +211,9 @@ class GitBackend(SyncBackend):
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             cwd=str(self.sync_dir),
-            capture_output=True, text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             subprocess.run(
@@ -222,7 +235,8 @@ class S3Backend(SyncBackend):
 
     Requires ``boto3`` — install with ``pip install cursaves[s3]``.
 
-    Configuration (in ~/.config/cursaves/config.json)::
+    Configuration (in ~/.config/cursaves/config.json, or
+    %APPDATA%\\cursaves\\config.json on Windows)::
 
         {
             "backend": "s3",
@@ -355,10 +369,11 @@ class S3Backend(SyncBackend):
 
 
 def load_config() -> dict:
-    """Load cursaves config from ~/.config/cursaves/config.json."""
-    if _CONFIG_PATH.exists():
+    """Load cursaves config from the platform config path."""
+    config_path = _get_config_path()
+    if config_path.exists():
         try:
-            return json.loads(_CONFIG_PATH.read_text())
+            return json.loads(config_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
     return {}
@@ -366,8 +381,9 @@ def load_config() -> dict:
 
 def save_config(config: dict):
     """Persist cursaves config."""
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+    config_path = _get_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
 def get_backend() -> SyncBackend:

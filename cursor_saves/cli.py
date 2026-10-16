@@ -195,15 +195,24 @@ def cmd_workspaces(args):
 def _is_remote_path(path: str, source_machine: str) -> bool:
     """Check if a path looks like it came from an SSH remote session."""
     import platform
-    
+
     # If path doesn't exist locally, it's likely remote
     if not os.path.exists(path):
         return True
-    
+
+    system = platform.system()
     # On Mac, local paths start with /Users
-    if platform.system() == "Darwin" and not path.startswith("/Users"):
+    if system == "Darwin" and not path.startswith("/Users"):
         return True
-    
+    # On Windows, Unix-style absolute paths are remote (SSH); drive/UNC are local
+    if system == "Windows":
+        if path.startswith("/") and not (len(path) >= 3 and path[1] == ":"):
+            return True
+        return False
+    # On Linux, a Windows drive path is from another machine
+    if system == "Linux" and len(path) >= 2 and path[1] == ":":
+        return True
+
     return False
 
 
@@ -778,7 +787,7 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
 
 def _get_sync_state_path() -> Path:
     """Path for local sync state (outside the git repo to survive git clean)."""
-    return Path.home() / ".config" / "cursaves" / "sync_state.json"
+    return paths.get_config_dir() / "sync_state.json"
 
 
 def _load_sync_state() -> dict:
