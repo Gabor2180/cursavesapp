@@ -272,7 +272,9 @@ You can see what identity is being used with `cursaves status`.
 
 For example, a conversation started on macOS at `/Users/you/Projects/myapp` will have its file references rewritten to `/home/you/repos/myapp` when imported on a Linux machine, or to `C:\Users\you\repos\myapp` on Windows — including `file://` URI forms.
 
-If the snapshot path differs from the folder you are in, `cursaves pull` asks for confirmation before importing (use `-y` to skip). You can also run `cursaves pull -s` to pick a snapshot project and pull it into the current directory.
+If the snapshot path differs from the folder you are in, `cursaves pull` asks for confirmation before importing (use `-y` to skip).
+
+**Which remote project is pulled?** `pull` matches by git remote URL, then folder name. If nothing matches or several could match, it opens an interactive picker. Use `cursaves pull -P` to always pick the remote project to import into the current folder, or `cursaves pull -s` to also choose individual chats.
 
 ## Restarting Cursor After Import
 
