@@ -268,9 +268,11 @@ You can see what identity is being used with `cursaves status`.
 
 ### Path rewriting
 
-When importing conversations on a different machine, absolute file paths in conversation metadata (e.g., which files were attached as context) are automatically rewritten to match the target project path. The actual conversation content -- your messages and AI responses -- is fully portable with no modification.
+**Folders do not need the same directory structure.** Projects match by git remote URL (or folder name as a fallback). When you `pull` into a different path on another machine, absolute file paths in conversation metadata are rewritten to the local folder. Chat content itself is unchanged.
 
 For example, a conversation started on macOS at `/Users/you/Projects/myapp` will have its file references rewritten to `/home/you/repos/myapp` when imported on a Linux machine, or to `C:\Users\you\repos\myapp` on Windows — including `file://` URI forms.
+
+If the snapshot path differs from the folder you are in, `cursaves pull` asks for confirmation before importing (use `-y` to skip). You can also run `cursaves pull -s` to pick a snapshot project and pull it into the current directory.
 
 ## Restarting Cursor After Import
 
