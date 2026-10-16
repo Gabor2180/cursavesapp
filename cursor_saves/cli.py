@@ -458,6 +458,58 @@ def cmd_import(args):
         sys.exit(1)
 
 
+def _collect_snapshot_source_paths(snapshot_dir: Path) -> set[str]:
+    """Collect sourceProjectPath values from snapshots in a directory."""
+    source_paths: set[str] = set()
+    for sf in list_snapshot_files(snapshot_dir):
+        meta = read_snapshot_meta(sf)
+        sp = meta.get("sourceProjectPath")
+        if sp:
+            source_paths.add(sp)
+    return source_paths
+
+
+def _differing_source_paths(source_paths: set[str], target_path: str) -> list[str]:
+    """Return snapshot source paths that differ from the import target."""
+    differing = []
+    for sp in sorted(source_paths):
+        if sp and not paths.paths_equal(sp, target_path):
+            differing.append(sp)
+    return differing
+
+
+def _confirm_pull_into_folder(
+    source_paths: set[str],
+    target_path: str,
+    *,
+    assume_yes: bool = False,
+) -> bool:
+    """Ask before importing into a folder whose path differs from the snapshot.
+
+    Returns True if import should proceed.
+    """
+    differing = _differing_source_paths(source_paths, target_path)
+    if not differing:
+        return True
+
+    target_norm = os.path.normpath(target_path)
+    print("\n  Snapshots were saved from a different folder path:")
+    for sp in differing[:5]:
+        print(f"    {sp}")
+    if len(differing) > 5:
+        print(f"    ... and {len(differing) - 5} more")
+    print(f"\n  Import into this folder?\n    {target_norm}")
+    print("  Paths inside chat metadata will be rewritten to the new location.")
+
+    if assume_yes:
+        print("  Proceeding (--yes).")
+        return True
+
+    from .interactive import confirm as tui_confirm
+
+    return tui_confirm("Pull conversations into this folder?", default=False)
+
+
 def _select_target_workspaces(source_paths: set[str]) -> list[dict]:
     """Find and optionally prompt user to select target workspaces for import.
 
@@ -1182,18 +1234,19 @@ def cmd_pull(args):
             selected_files = [s["file"] for s in selected_snaps]
             print(f"\n  Importing {len(selected_files)} chat(s) from {project['name']}/...")
 
-            # Find target workspace
+            # Find target workspace, or offer the current folder
             target_workspaces = _select_target_workspaces(project["source_paths"])
+            assume_yes = getattr(args, "yes", False)
 
             if not target_workspaces:
                 cwd = os.getcwd()
-                cwd_basename = os.path.basename(os.path.normpath(cwd))
-                source_basenames = {os.path.basename(os.path.normpath(sp)) for sp in project["source_paths"]}
-                if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
+                print("  No matching Cursor workspace found for the snapshot path(s).")
+                if _confirm_pull_into_folder(
+                    project["source_paths"], cwd, assume_yes=assume_yes
+                ):
                     target_path = cwd
                 else:
-                    print(f"  No matching workspaces found.")
-                    print(f"  Enter a local project path to import into (or press Enter to skip):")
+                    print("  Enter a local project path to import into (or press Enter to skip):")
                     try:
                         target_path = input("  > ").strip()
                     except (EOFError, KeyboardInterrupt):
@@ -1202,17 +1255,27 @@ def cmd_pull(args):
                     if not target_path:
                         print("  Skipped.")
                         continue
+                    if not _confirm_pull_into_folder(
+                        project["source_paths"], target_path, assume_yes=assume_yes
+                    ):
+                        print("  Cancelled.")
+                        continue
 
                 for sf in selected_files:
                     print(f"  Importing {sf.name}...")
                     if import_snapshot(sf, target_path):
                         total_success += 1
-                        print(f"    OK")
+                        print("    OK")
                     else:
                         total_failure += 1
-                        print(f"    FAILED")
+                        print("    FAILED")
             else:
                 for ws in target_workspaces:
+                    if not _confirm_pull_into_folder(
+                        project["source_paths"], ws["path"], assume_yes=assume_yes
+                    ):
+                        print(f"  Skipped {paths.format_workspace_display(ws)}")
+                        continue
                     display = paths.format_workspace_display(ws)
                     print(f"  Importing into: {display}")
                     for sf in selected_files:
@@ -1230,20 +1293,31 @@ def cmd_pull(args):
         if total_success > 0:
             _maybe_reload(args)
     else:
-        # Non-interactive: import for the resolved project/workspace
+        # Non-interactive: import for the resolved project/workspace (cwd by default)
         project_path, workspace_dir = _resolve_workspace_for_import(args)
-        if workspace_dir:
-            # Show which workspace we're importing into
-            ws_info = paths.format_workspace_display(
-                {"type": "ssh" if "ssh" in str(workspace_dir) else "local",
-                 "host": None, "path": project_path},
-                include_path=True
-            )
-            print(f"Importing into workspace: {project_path}")
-        else:
-            print(f"Importing snapshots for {project_path}...")
+        assume_yes = getattr(args, "yes", False)
+        snapshot_dir = find_snapshot_dir_for_project(project_path)
 
-        success, failure = import_all_snapshots(
+        if not snapshot_dir:
+            project_id = paths.get_project_identifier(project_path)
+            print(f"No snapshots found for project '{project_id}'", file=sys.stderr)
+            print("Run 'cursaves snapshots' to see available projects,", file=sys.stderr)
+            print("or 'cursaves pull -s' to pick one and import into this folder.", file=sys.stderr)
+            return
+
+        source_paths = _collect_snapshot_source_paths(snapshot_dir)
+        if not source_paths:
+            source_paths = {project_path}
+
+        print(f"Importing snapshots into: {os.path.normpath(project_path)}")
+        if not _confirm_pull_into_folder(
+            source_paths, project_path, assume_yes=assume_yes
+        ):
+            print("Cancelled.")
+            return
+
+        success, failure = import_from_snapshot_dir(
+            snapshot_dir,
             project_path,
             force=args.force,
             target_workspace_dir=workspace_dir,
@@ -1861,6 +1935,10 @@ def main():
         help="Suppress the Cursor-running warning",
     )
     p_pull.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation when importing into a folder with a different path",
+    )
+    p_pull.add_argument(
         "--reload", action="store_true",
         help="(deprecated, no effect) Cursor requires a full restart to see imports",
     )
@@ -1993,8 +2071,9 @@ def main():
             "  init -r <url>         Initialize with git remote URL\n"
             "  push                  Save + commit + push all chats\n"
             "  push -s               Select workspace + chats to push\n"
-            "  pull                  Pull + import chats\n"
+            "  pull                  Pull + import chats into this folder\n"
             "  pull -s               Select which snapshots to import\n"
+            "  pull -y               Skip path-mismatch confirmation\n"
             "\n"
             "─── Copy between workspaces (same machine) ─────────────────────\n"
             "\n"
