@@ -127,8 +127,19 @@ def decode_file_uri(uri: str) -> str:
 
 
 def normalize_path_for_compare(path: str) -> str:
-    """Normalize a path for equality / substring comparison."""
-    normalized = os.path.normpath(os.path.expanduser(path))
+    """Normalize a path for equality / substring comparison.
+
+    Resolves symlinks/junctions when the path exists so OneDrive-redirected
+    Desktop/Documents paths compare equal to their unresolved spellings.
+    """
+    expanded = os.path.expanduser(path)
+    try:
+        p = Path(expanded)
+        if p.exists():
+            expanded = str(p.resolve())
+    except OSError:
+        pass
+    normalized = os.path.normpath(expanded)
     if _is_windows():
         return normalized.replace("/", "\\").casefold()
     return normalized
@@ -137,6 +148,17 @@ def normalize_path_for_compare(path: str) -> str:
 def paths_equal(a: str, b: str) -> bool:
     """Compare two filesystem paths, case-insensitively on Windows."""
     return normalize_path_for_compare(a) == normalize_path_for_compare(b)
+
+
+def path_basename(path: str) -> str:
+    """Return the final path component, casefolded on Windows.
+
+    Normalizes separators first so Windows-style paths compare correctly
+    even when this code runs under a POSIX Python (tests / WSL).
+    """
+    normalized = path.replace("\\", "/").rstrip("/")
+    name = normalized.rsplit("/", 1)[-1] if normalized else ""
+    return name.casefold() if _is_windows() else name
 
 
 def _decode_ssh_host(host: str) -> str:
@@ -157,17 +179,43 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def _folder_path_from_workspace_json(data: dict) -> Optional[str]:
+    """Extract a filesystem path from a workspace.json payload."""
+    if "workspace" in data and not data.get("folder"):
+        ws_uri = data.get("workspace", "")
+        if ws_uri.startswith("file://"):
+            return decode_file_uri(ws_uri)
+        return None
+
+    folder_uri = data.get("folder", "")
+    if folder_uri.startswith("file://"):
+        return decode_file_uri(folder_uri)
+    if folder_uri.startswith("vscode-remote://"):
+        # Format: vscode-remote://ssh-remote%2B<host>/<path>
+        parts = folder_uri.split("/", 3)
+        if len(parts) >= 4:
+            return "/" + unquote(parts[3])
+    return None
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
     Scans workspace.json files in workspaceStorage/ to find matches.
+    Prefers exact path matches (after resolve/casefold). If none, falls
+    back to a unique folder-basename match so OneDrive Desktop redirects
+    and minor path spelling differences still resolve.
+
     Returns list of workspace directory paths, newest first.
     """
     ws_storage = get_workspace_storage_dir()
     if not ws_storage.exists():
         return []
 
-    matches = []
+    exact: list[Path] = []
+    basename_hits: list[Path] = []
+    target_basename = path_basename(project_path)
+
     for ws_dir in ws_storage.iterdir():
         if not ws_dir.is_dir():
             continue
@@ -175,28 +223,19 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
         if not ws_json.exists():
             continue
         try:
-            data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = decode_file_uri(folder_uri)
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
+            data = json.loads(ws_json.read_text(encoding="utf-8"))
+            folder_path = _folder_path_from_workspace_json(data)
+            if not folder_path:
                 continue
 
             if paths_equal(folder_path, project_path):
-                matches.append(ws_dir)
-        except (json.JSONDecodeError, OSError):
+                exact.append(ws_dir)
+            elif path_basename(folder_path) == target_basename:
+                basename_hits.append(ws_dir)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
 
-    # Sort by modification time, newest first
+    matches = exact if exact else basename_hits
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches
 
@@ -256,50 +295,36 @@ def list_all_workspaces() -> list[dict]:
         if not ws_json.exists():
             continue
         try:
-            data = json.loads(ws_json.read_text())
+            data = json.loads(ws_json.read_text(encoding="utf-8"))
 
             ws_type = "local"
             host = None
             folder_path = ""
-            folder_uri = ""
+            folder_uri = data.get("folder") or data.get("workspace") or ""
 
-            # workspace .code-workspace: uses "workspace" key instead of "folder"
             if "workspace" in data and not data.get("folder"):
-                ws_uri = data["workspace"]
-                if ws_uri.startswith("file://"):
-                    folder_uri = ws_uri
-                    folder_path = decode_file_uri(ws_uri)
-                    ws_type = "workspace"
-                else:
+                if not folder_uri.startswith("file://"):
+                    continue
+                folder_path = decode_file_uri(folder_uri)
+                ws_type = "workspace"
+            elif folder_uri.startswith("file://"):
+                folder_path = decode_file_uri(folder_uri)
+            elif folder_uri.startswith("vscode-remote://"):
+                ws_type = "ssh"
+                authority = folder_uri.split("/")[2]
+                if "%2B" in authority:
+                    host = authority.split("%2B", 1)[1]
+                elif "+" in authority:
+                    host = authority.split("+", 1)[1]
+                if host:
+                    host = unquote(host)
+                    host = _decode_ssh_host(host)
+                folder_path = _folder_path_from_workspace_json(data) or ""
+                if not folder_path:
                     continue
             else:
-                folder_uri = data.get("folder", "")
-                if not folder_uri:
-                    continue
+                continue
 
-                if folder_uri.startswith("file://"):
-                    folder_path = decode_file_uri(folder_uri)
-                elif folder_uri.startswith("vscode-remote://"):
-                    ws_type = "ssh"
-                    # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                    authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                    if "%2B" in authority:
-                        host = authority.split("%2B", 1)[1]
-                    elif "+" in authority:
-                        host = authority.split("+", 1)[1]
-                    # Decode URL-encoded and hex-encoded JSON hosts
-                    if host:
-                        host = unquote(host)
-                        host = _decode_ssh_host(host)
-                    parts = folder_uri.split("/", 3)
-                    if len(parts) >= 4:
-                        folder_path = "/" + unquote(parts[3])
-                    else:
-                        continue
-                else:
-                    continue
-
-            # Get DB modification time
             db_path = ws_dir / "state.vscdb"
             mtime = db_path.stat().st_mtime if db_path.exists() else 0
 
@@ -311,7 +336,7 @@ def list_all_workspaces() -> list[dict]:
                 "workspace_dir": ws_dir,
                 "mtime": mtime,
             })
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
 
     # Sort by modification time, newest first

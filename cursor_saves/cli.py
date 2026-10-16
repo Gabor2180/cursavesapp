@@ -1037,14 +1037,38 @@ def cmd_push(args):
 
     if not saved:
         print("No conversations found to checkpoint.")
-        if workspace_dir is None and not paths.find_workspace_dirs_for_project(project_path):
-            print(
-                "\nNo Cursor workspace matches this directory.\n"
-                "  - cd into the project you opened in Cursor, then retry, or\n"
-                "  - run 'cursaves workspaces' and use 'cursaves push -w <number>', or\n"
-                "  - run 'cursaves push -s' to pick a workspace interactively",
-                file=sys.stderr,
-            )
+        if workspace_dir is None:
+            matched = paths.find_workspace_dirs_for_project(project_path)
+            if matched:
+                print(
+                    f"\nMatched {len(matched)} Cursor workspace folder(s) for this path, "
+                    "but none have conversations cursaves can read.\n"
+                    "  - run 'cursaves workspaces' and try 'cursaves push -w <number>', or\n"
+                    "  - run 'cursaves push -s' to pick a workspace interactively",
+                    file=sys.stderr,
+                )
+            else:
+                basename = paths.path_basename(project_path)
+                similar = [
+                    ws for ws in paths.list_workspaces_with_conversations()
+                    if paths.path_basename(ws["path"]) == basename
+                    or basename in ws["path"].replace("\\", "/").casefold()
+                ]
+                print(
+                    "\nNo Cursor workspace matches this directory.\n"
+                    "  - cd into the project you opened in Cursor, then retry, or\n"
+                    "  - run 'cursaves workspaces' and use 'cursaves push -w <number>', or\n"
+                    "  - run 'cursaves push -s' to pick a workspace interactively",
+                    file=sys.stderr,
+                )
+                if similar:
+                    print("\nWorkspaces with a similar name:", file=sys.stderr)
+                    for ws in similar[:8]:
+                        print(
+                            f"  {paths.format_workspace_display(ws)}  "
+                            f"[{ws['workspace_dir'].name[:8]}]",
+                            file=sys.stderr,
+                        )
         return
 
     print(f"  {len(saved)} conversation(s) checkpointed")
