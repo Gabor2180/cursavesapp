@@ -510,6 +510,109 @@ def _confirm_pull_into_folder(
     return tui_confirm("Pull conversations into this folder?", default=False)
 
 
+def _snapshot_project_candidates(project_path: str, projects: list[dict]) -> list[dict]:
+    """Return snapshot projects that likely belong to *project_path*."""
+    project_id = paths.get_project_identifier(project_path)
+    basename = paths.path_basename(project_path)
+
+    exact = [p for p in projects if p["name"] == project_id]
+    if exact:
+        return exact
+
+    matches: list[dict] = []
+    seen: set[str] = set()
+    for p in projects:
+        hit = p["name"] == basename or paths.path_basename(p["name"]) == basename
+        if not hit:
+            for sp in p.get("source_paths", set()):
+                if paths.path_basename(sp) == basename:
+                    hit = True
+                    break
+        if hit and p["name"] not in seen:
+            seen.add(p["name"])
+            matches.append(p)
+    return matches
+
+
+def _pick_snapshot_project_interactive(
+    projects: list[dict],
+    *,
+    message: str,
+) -> dict | None:
+    """Fuzzy-pick a snapshot project to import."""
+    from .interactive import select_one
+
+    choices = []
+    for p in projects:
+        sources = ", ".join(sorted(p["sources"])) or "unknown"
+        src_paths = sorted(p.get("source_paths") or [])
+        if src_paths:
+            preview = src_paths[0]
+            if len(preview) > 42:
+                preview = "..." + preview[-39:]
+            if len(src_paths) > 1:
+                preview += f" (+{len(src_paths) - 1})"
+        else:
+            preview = "unknown path"
+        last_saved = (p.get("latest_export") or "")[:16] or "unknown"
+        display = (
+            f"{p['name']:<28} {p['count']:>3} chats  "
+            f"{last_saved}  from {sources}  {preview}"
+        )
+        choices.append({"name": display, "_project": p})
+
+    selected = select_one(choices, message=message)
+    if not selected:
+        return None
+    return selected["_project"]
+
+
+def _resolve_snapshot_project_for_pull(
+    project_path: str,
+    *,
+    force_select: bool = False,
+) -> dict | None:
+    """Decide which snapshot project to pull into *project_path*.
+
+    Matching order:
+      1. Unique project-id / basename / source-path match → use it
+      2. Multiple matches → interactive pick among matches
+      3. No matches → interactive pick among all snapshot projects
+      4. force_select → always interactive among all projects
+    """
+    projects = list_snapshot_projects()
+    if not projects:
+        return None
+
+    if force_select:
+        return _pick_snapshot_project_interactive(
+            projects,
+            message="Select which remote project to pull into this folder:",
+        )
+
+    candidates = _snapshot_project_candidates(project_path, projects)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        print(
+            f"\n  {len(candidates)} snapshot projects could match this folder.",
+            file=sys.stderr,
+        )
+        return _pick_snapshot_project_interactive(
+            candidates,
+            message="Select which remote project to pull into this folder:",
+        )
+
+    print(
+        "\n  No automatic match for this folder - pick a remote project to import.",
+        file=sys.stderr,
+    )
+    return _pick_snapshot_project_interactive(
+        projects,
+        message="Select which remote project to pull into this folder:",
+    )
+
+
 def _select_target_workspaces(source_paths: set[str]) -> list[dict]:
     """Find and optionally prompt user to select target workspaces for import.
 
@@ -1307,23 +1410,26 @@ def cmd_pull(args):
         if total_success > 0:
             _maybe_reload(args)
     else:
-        # Non-interactive: import for the resolved project/workspace (cwd by default)
+        # Import into resolved project/workspace (cwd by default).
+        # Auto-match by git remote / folder name; if unclear, pick interactively.
         project_path, workspace_dir = _resolve_workspace_for_import(args)
         assume_yes = getattr(args, "yes", False)
-        snapshot_dir = find_snapshot_dir_for_project(project_path)
+        force_select = getattr(args, "pick", False)
 
-        if not snapshot_dir:
-            project_id = paths.get_project_identifier(project_path)
-            print(f"No snapshots found for project '{project_id}'", file=sys.stderr)
-            print("Run 'cursaves snapshots' to see available projects,", file=sys.stderr)
-            print("or 'cursaves pull -s' to pick one and import into this folder.", file=sys.stderr)
+        project = _resolve_snapshot_project_for_pull(
+            project_path, force_select=force_select
+        )
+        if not project:
+            print("No snapshots found. Run 'cursaves push' on another machine first.")
             return
 
-        source_paths = _collect_snapshot_source_paths(snapshot_dir)
+        snapshot_dir = project["path"]
+        source_paths = set(project.get("source_paths") or [])
         if not source_paths:
-            source_paths = {project_path}
+            source_paths = _collect_snapshot_source_paths(snapshot_dir) or {project_path}
 
-        print(f"Importing snapshots into: {os.path.normpath(project_path)}")
+        print(f"Remote project: {project['name']} ({project['count']} chat(s))")
+        print(f"Importing into: {os.path.normpath(project_path)}")
         if not _confirm_pull_into_folder(
             source_paths, project_path, assume_yes=assume_yes
         ):
@@ -1942,7 +2048,11 @@ def main():
     p_pull.add_argument("--project", "-p", help="Project path (default: current directory)")
     p_pull.add_argument(
         "--select", "-s", action="store_true",
-        help="Interactively select which snapshot projects to import",
+        help="Interactively select snapshot project and individual chats",
+    )
+    p_pull.add_argument(
+        "--pick", "-P", action="store_true",
+        help="Interactively pick which remote project to pull into this folder",
     )
     p_pull.add_argument(
         "--force", action="store_true",
@@ -2086,7 +2196,8 @@ def main():
             "  push                  Save + commit + push all chats\n"
             "  push -s               Select workspace + chats to push\n"
             "  pull                  Pull + import chats into this folder\n"
-            "  pull -s               Select which snapshots to import\n"
+            "  pull -P               Pick which remote project to pull here\n"
+            "  pull -s               Select project + individual chats\n"
             "  pull -y               Skip path-mismatch confirmation\n"
             "\n"
             "─── Copy between workspaces (same machine) ─────────────────────\n"
