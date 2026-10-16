@@ -610,6 +610,14 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
     if not conversations:
         print(f"No conversations found for {project_path}")
+        if workspace_dir is None and not paths.find_workspace_dirs_for_project(project_path):
+            print(
+                "\nNo Cursor workspace matches this directory.\n"
+                "  - cd into the project you opened in Cursor, then retry, or\n"
+                "  - run 'cursaves workspaces' and use 'cursaves push -w <number>', or\n"
+                "  - run 'cursaves push -s' to pick a workspace interactively",
+                file=sys.stderr,
+            )
         return []
 
     conversations.sort(key=lambda c: c.get("lastUpdated", ""), reverse=True)
@@ -998,7 +1006,7 @@ def cmd_push(args):
         if not backend.pull(snapshots_dir):
             print("Warning: Could not sync with remote, continuing anyway...", file=sys.stderr)
 
-    # Resolve workspace and select conversations
+    # Resolve workspace; interactive conversation pick only with -s
     composer_ids = None
     workspace_dir = None
     source_host = None
@@ -1007,17 +1015,17 @@ def cmd_push(args):
         if not result:
             return
         project_path, workspace_dir, source_host = result
+        if not getattr(args, "all_chats", False):
+            composer_ids = _select_conversations(
+                project_path, prompt="push", workspace_dir=workspace_dir
+            )
+            if not composer_ids:
+                print("No conversations selected.")
+                return
     else:
         project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
 
-    # Always show conversation list for selection (unless --all flag)
-    if not getattr(args, "all_chats", False):
-        composer_ids = _select_conversations(project_path, prompt="push", workspace_dir=workspace_dir)
-        if not composer_ids:
-            print("No conversations selected.")
-            return
-
-    # Step 1: Checkpoint
+    # Step 1: Checkpoint (all conversations by default)
     if composer_ids:
         print(f"\nCheckpointing {len(composer_ids)} conversation(s)...")
     else:
@@ -1029,6 +1037,14 @@ def cmd_push(args):
 
     if not saved:
         print("No conversations found to checkpoint.")
+        if workspace_dir is None and not paths.find_workspace_dirs_for_project(project_path):
+            print(
+                "\nNo Cursor workspace matches this directory.\n"
+                "  - cd into the project you opened in Cursor, then retry, or\n"
+                "  - run 'cursaves workspaces' and use 'cursaves push -w <number>', or\n"
+                "  - run 'cursaves push -s' to pick a workspace interactively",
+                file=sys.stderr,
+            )
         return
 
     print(f"  {len(saved)} conversation(s) checkpointed")
@@ -1791,11 +1807,11 @@ def main():
     add_project_args(p_push)
     p_push.add_argument(
         "--select", "-s", action="store_true",
-        help="Interactively select workspace first",
+        help="Interactively pick workspace and conversations (default pushes all)",
     )
     p_push.add_argument(
         "--all", dest="all_chats", action="store_true",
-        help="Push all conversations without selection prompt",
+        help="With -s, push all conversations in the chosen workspace (skip chat picker)",
     )
     p_push.add_argument(
         "--ahead", "-a", action="store_true",
@@ -1951,7 +1967,7 @@ def main():
             "\n"
             "  init                  Initialize ~/.cursaves/ sync repo\n"
             "  init -r <url>         Initialize with git remote URL\n"
-            "  push                  Save + commit + push chats\n"
+            "  push                  Save + commit + push all chats\n"
             "  push -s               Select workspace + chats to push\n"
             "  pull                  Pull + import chats\n"
             "  pull -s               Select which snapshots to import\n"
